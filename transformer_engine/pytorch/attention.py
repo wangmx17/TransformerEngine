@@ -1887,12 +1887,10 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         else:
             qkv_layout = qkv_format + "_" + qkv_format + "_" + qkv_format
 
-        pad_between_seqs_q = cu_seqlens_q_padded is not None and not torch.equal(
-            cu_seqlens_q_padded[:-1], cu_seqlens_q[:-1]
-        )
-        pad_between_seqs_kv = cu_seqlens_kv_padded is not None and not torch.equal(
-            cu_seqlens_kv_padded[:-1], cu_seqlens_kv[:-1]
-        )
+        # Avoid a device-to-host synchronization from torch.equal on MUSA.
+        # The padded path is also valid when the tensors are equal.
+        pad_between_seqs_q = cu_seqlens_q_padded is not None
+        pad_between_seqs_kv = cu_seqlens_kv_padded is not None
         max_seqlen_q = max_seqlen_q // cp_size
         max_seqlen_kv = max_seqlen_kv // cp_size
         cu_seqlens_q_padded = (
@@ -2042,45 +2040,44 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         rng_states = [None for _ in range(cp_size)]
         attn_biases = [None for _ in range(cp_size)]
 
-        # create two streams to resolve wave quantization issue of Flash Attn in each step
-        flash_attn_streams = [torch.cuda.current_stream(), cp_stream]
-        # synchronize fwd results correction across steps
-        fwd_results_correction_done = torch.cuda.Event()
-
-        p2p_comm_buffers = [None for _ in range(cp_size)]
+        # Double-buffer the ring KV exchange. ProcessGroupMCCL Work.wait()
+        # inserts a MUSA event dependency on the current stream; it does not
+        # synchronize the device when blocking wait is disabled.
+        p2p_comm_buffers = [None, None]
         if qkv_format in ["bshd", "sbhd"]:
             p2p_comm_buffers[0] = torch.cat((k.unsqueeze(-3), v.unsqueeze(-3)), dim=-3)
         else:
             p2p_comm_buffers[0] = torch.cat((k.unsqueeze(0), v.unsqueeze(0)), dim=0)
+        p2p_comm_buffers[1] = torch.empty_like(p2p_comm_buffers[0])
         send_recv_reqs = [[], []]
 
         softmax_lse_ = None
         out = None
         for i in range(cp_size + 1):
             if i < cp_size:
-                if True: # placeholder 
-                # with torch.cuda.stream(flash_attn_streams[i % 2]):
-                    # wait until KV is received
-                    # for req in send_recv_reqs[(i + 1) % 2]:
-                    #     req.wait()
+                if True:
+                    # Wait only for the receive buffer that this FA step consumes.
+                    # WorkMCCL implements this as a device-side MUSA event wait.
+                    for req in send_recv_reqs[(i + 1) % 2]:
+                        req.wait()
 
+                    # Pre-submit the next ring transfer before launching current FA.
                     if i < (cp_size - 1):
-                        p2p_comm_buffers[i + 1] = torch.empty_like(p2p_comm_buffers[i])
-                        send_recv_reqs[i % 2] = flash_attn_p2p_communicate_sync(
+                        send_recv_reqs[i % 2] = flash_attn_p2p_communicate(
                             rank,
-                            p2p_comm_buffers[i],
+                            p2p_comm_buffers[i % 2],
                             send_dst,
-                            p2p_comm_buffers[i + 1],
+                            p2p_comm_buffers[(i + 1) % 2],
                             recv_src,
                             cp_group,
                             batch_p2p_comm,
                         )
 
                     if not fp8 or is_input_fp8 or int(os.getenv("NVTE_FP8_DPA_BWD", "1")):
-                        kv_inputs[i % 2] = p2p_comm_buffers[i]
+                        kv_inputs[i % 2] = p2p_comm_buffers[i % 2]
                     else:
                         # KV exchange is in BF16/FP16, cast received KV in each step
-                        kv_inputs[i % 2] = QKV_quantizer(p2p_comm_buffers[i])
+                        kv_inputs[i % 2] = QKV_quantizer(p2p_comm_buffers[i % 2])
                     if causal:
                         if i == 0:
                             if pad_between_seqs_q:
@@ -2688,7 +2685,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                         softmax_lse_in_packed_format,
                     )
 
-        kv = p2p_comm_buffers[-1]
+        kv = p2p_comm_buffers[(cp_size - 1) % 2]
         if qkv_format == "bshd":
             out = out.view(out.shape[0], -1, *out.shape[-2:])
             ctx.batch_size = out.shape[0]
@@ -2945,15 +2942,15 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     fa_backward_kwargs["softcap"] = 0.0
 
         for i in range(cp_size):
-            # wait until KV is received
-            # for req in send_recv_reqs:
-            #     req.wait()
+            # Wait only for the KV buffer consumed by this FA step.
+            for req in send_recv_reqs:
+                req.wait()
 
             send_tensor = p2p_comm_buffers[i % 2]
             recv_tensor = p2p_comm_buffers[(i + 1) % 2]
             if ctx.fp8:
                 if i < cp_size - 1:
-                    send_recv_reqs = flash_attn_p2p_communicate_sync(
+                    send_recv_reqs = flash_attn_p2p_communicate(
                         rank,
                         send_tensor[0],
                         send_dst,
@@ -2967,7 +2964,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                         dkv_fp8,
                         dkv_fp8_,
                         group=ctx.cp_group,
-                        # async_op=True,
+                        async_op=True,
                     )
                     send_recv_reqs = [dkv_a2a_req]
             else:
@@ -2977,7 +2974,7 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                 if i == (cp_size - 1):
                     send_tensor = send_tensor[1]
                     recv_tensor = recv_tensor[1]
-                send_recv_reqs = flash_attn_p2p_communicate_sync(
+                send_recv_reqs = flash_attn_p2p_communicate(
                     rank, send_tensor, send_dst, recv_tensor, recv_src, ctx.cp_group, batch_p2p_comm
                 )
 
@@ -3490,9 +3487,10 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                     attn_dbias_[..., 1, :, idx, :].copy_(dbias_[..., 0, :])
                     attn_dbias_[..., 1, :, (2 * cp_size - idx - 1), :].copy_(dbias_[..., 1, :])
 
-            # wait until dKV is received
-            # for req in send_recv_reqs:
-            #     req.wait()
+            # Wait for this ring transfer after FA has been submitted,
+            # allowing MCCL communication to overlap the attention kernel.
+            for req in send_recv_reqs:
+                req.wait()
 
             if ctx.fp8:
                 if i < cp_size - 1:
