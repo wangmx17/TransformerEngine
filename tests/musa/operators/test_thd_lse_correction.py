@@ -72,3 +72,67 @@ def test_thd_read_half_tensor_3(dtype, half_idx):
     assert len(actual) == 3
     for actual_tensor, expected_tensor in zip(actual, expected):
         torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("full_step_count", [1, 2, 4])
+def test_thd_out_correction_4_single(dtype, full_step_count):
+    torch.manual_seed(1234)
+    total_tokens = 16
+    num_heads = 4
+    dim_per_head = 64
+    cu_seqlens = torch.tensor([0, total_tokens], dtype=torch.int32, device="musa")
+    out_per_step = []
+    lse_per_step = []
+
+    for step in range(4):
+        step_tokens = total_tokens if step < full_step_count else total_tokens // 2
+        step_out = torch.randn(
+            step_tokens, num_heads, dim_per_head, dtype=dtype, device="musa"
+        )
+        # Exercise the zero-preserving path used to avoid 0 * inf -> nan.
+        step_out[::5] = 0
+        out_per_step.append(step_out)
+        lse_per_step.append(
+            torch.randn(1, num_heads, step_tokens, dtype=torch.float32, device="musa")
+        )
+
+    expected_lse = lse_per_step[0].clone()
+    for step in range(1, 4):
+        if step < full_step_count:
+            max_scale = torch.maximum(expected_lse, lse_per_step[step])
+            min_scale = torch.minimum(expected_lse, lse_per_step[step])
+            expected_lse.copy_(max_scale + torch.log(1 + torch.exp(min_scale - max_scale)))
+        else:
+            tex.thd_second_half_lse_correction(
+                expected_lse, lse_per_step[step], cu_seqlens, False
+            )
+
+    expected_out = torch.zeros(
+        total_tokens, num_heads, dim_per_head, dtype=dtype, device="musa"
+    )
+    for step in range(4):
+        tex.thd_out_correction(
+            expected_out,
+            out_per_step[step],
+            expected_lse,
+            lse_per_step[step],
+            cu_seqlens,
+            step >= full_step_count,
+            False,
+        )
+
+    actual_out = torch.empty_like(expected_out)
+    actual_lse = lse_per_step[0].clone()
+    tex.thd_out_correction_4_single(
+        actual_out,
+        out_per_step,
+        actual_lse,
+        lse_per_step,
+        cu_seqlens,
+        full_step_count,
+    )
+
+    tolerance = 1e-6 if dtype == torch.float32 else (1e-3 if dtype == torch.float16 else 1e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(actual_out, expected_out, rtol=tolerance, atol=tolerance)

@@ -285,6 +285,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("thd_out_correction", &thd_out_correction,
         "Correct the THD format output of context parallelism in forward pass",
         py::call_guard<py::gil_scoped_release>());
+  m.def("thd_out_correction_4_single", &thd_out_correction_4_single,
+        "Fuse THD LSE merge and four output corrections for one-sequence context parallelism",
+        py::call_guard<py::gil_scoped_release>());
   m.def("thd_grad_correction", &thd_grad_correction,
         "Correct the THD format gradients of context parallelism in backward pass",
         py::call_guard<py::gil_scoped_release>());

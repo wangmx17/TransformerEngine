@@ -2056,6 +2056,15 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
 
         softmax_lse_ = None
         out = None
+        use_musa_thd_cp_correction_fusion = (
+            int(os.getenv("NVTE_MUSA_THD_CP_CORRECTION_FUSION", "0"))
+            and hasattr(tex, "thd_out_correction_4_single")
+            and qkv_format == "thd"
+            and cp_size == 4
+            and not fp8
+            and not softmax_lse_in_packed_format
+            and cu_seqlens_q_padded.numel() == 2
+        )
         for i in range(cp_size + 1):
             if i < cp_size:
                 if True: # placeholder 
@@ -2618,6 +2627,9 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                             softmax_lse_ = softmax_lse.view(
                                 *softmax_lse.shape[:-1], 2, softmax_lse.shape[-1] // 2
                             )
+                    elif use_musa_thd_cp_correction_fusion:
+                        # Merge all per-step LSE and output correction work after the CP loop.
+                        pass
                     elif (i - 1) <= rank or not causal:
                         flash_attn_fwd_softmax_lse_correction(
                             softmax_lse, softmax_lse_per_step[i - 1]
@@ -2645,48 +2657,58 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
             second_half_lse_seqlen = softmax_lse_per_step[-1].shape[-1]
 
         softmax_lse = softmax_lse.to(torch.float)
-        for i in range(cp_size):
-            if i <= rank or not causal:
-                if qkv_format in ["bshd", "sbhd"]:
-                    flash_attn_fwd_out_correction(
-                        out.view(*out_per_step[i].shape),
-                        out_per_step[i],
-                        softmax_lse,
-                        softmax_lse_per_step[i],
-                        0 if softmax_lse_in_packed_format else 2,
-                        2 if softmax_lse_in_packed_format else seq_dim,
-                    )
-                elif qkv_format == "thd":
-                    tex.thd_out_correction(
-                        out,
-                        out_per_step[i],
-                        softmax_lse,
-                        softmax_lse_per_step[i],
-                        cu_seqlens_q_padded,
-                        False,
-                        softmax_lse_in_packed_format,
-                    )
-            else:
-                if qkv_format in ["bshd", "sbhd"]:
-                    out_ = out.select(seq_dim, 1)
-                    flash_attn_fwd_out_correction(
-                        out_,
-                        out_per_step[i],
-                        softmax_lse_[..., 1, :],
-                        softmax_lse_per_step[i],
-                        0 if softmax_lse_in_packed_format else 2,
-                        2 if softmax_lse_in_packed_format else seq_dim,
-                    )
-                elif qkv_format == "thd":
-                    tex.thd_out_correction(
-                        out,
-                        out_per_step[i],
-                        softmax_lse,
-                        softmax_lse_per_step[i],
-                        cu_seqlens_q_padded,
-                        True,
-                        softmax_lse_in_packed_format,
-                    )
+        if use_musa_thd_cp_correction_fusion:
+            tex.thd_out_correction_4_single(
+                out,
+                out_per_step,
+                softmax_lse,
+                softmax_lse_per_step,
+                cu_seqlens_q_padded,
+                rank + 1 if causal else cp_size,
+            )
+        else:
+            for i in range(cp_size):
+                if i <= rank or not causal:
+                    if qkv_format in ["bshd", "sbhd"]:
+                        flash_attn_fwd_out_correction(
+                            out.view(*out_per_step[i].shape),
+                            out_per_step[i],
+                            softmax_lse,
+                            softmax_lse_per_step[i],
+                            0 if softmax_lse_in_packed_format else 2,
+                            2 if softmax_lse_in_packed_format else seq_dim,
+                        )
+                    elif qkv_format == "thd":
+                        tex.thd_out_correction(
+                            out,
+                            out_per_step[i],
+                            softmax_lse,
+                            softmax_lse_per_step[i],
+                            cu_seqlens_q_padded,
+                            False,
+                            softmax_lse_in_packed_format,
+                        )
+                else:
+                    if qkv_format in ["bshd", "sbhd"]:
+                        out_ = out.select(seq_dim, 1)
+                        flash_attn_fwd_out_correction(
+                            out_,
+                            out_per_step[i],
+                            softmax_lse_[..., 1, :],
+                            softmax_lse_per_step[i],
+                            0 if softmax_lse_in_packed_format else 2,
+                            2 if softmax_lse_in_packed_format else seq_dim,
+                        )
+                    elif qkv_format == "thd":
+                        tex.thd_out_correction(
+                            out,
+                            out_per_step[i],
+                            softmax_lse,
+                            softmax_lse_per_step[i],
+                            cu_seqlens_q_padded,
+                            True,
+                            softmax_lse_in_packed_format,
+                        )
 
         kv = p2p_comm_buffers[-1]
         if qkv_format == "bshd":

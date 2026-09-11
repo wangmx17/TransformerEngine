@@ -167,6 +167,90 @@ __global__ void thd_out_correction_kernel(dtype *out, dtype *out_per_step, float
   }
 }
 
+/*
+ * Fuse the LSE merge and four output-correction launches used by CP=4 into one launch.
+ *
+ * This specialized kernel intentionally handles the MiniCPM5 fast-path only:
+ * one THD sequence and unpacked LSE.  The first `full_step_count` inputs cover
+ * the complete local sequence; the remaining inputs cover its second half.
+ * Unsupported layouts continue to use thd_out_correction_kernel above.
+ */
+template <typename dtype, int tile_size>
+__global__ void thd_out_correction_4_single_kernel(
+    dtype *out, const dtype *out_0, const dtype *out_1, const dtype *out_2,
+    const dtype *out_3, float *lse, const float *lse_0, const float *lse_1,
+    const float *lse_2, const float *lse_3, int full_step_count, int total_tokens,
+    int num_heads, int dim_per_head, int lse_seqlen, int lse_0_seqlen,
+    int lse_1_seqlen, int lse_2_seqlen, int lse_3_seqlen) {
+  int tile_id = (blockIdx.x * blockDim.x + threadIdx.x) / tile_size;
+  int lane_id = threadIdx.x % tile_size;
+  int num_tiles = (blockDim.x * gridDim.x) / tile_size;
+  int num_loops_per_head = dim_per_head * sizeof(dtype) / sizeof(float4);
+  int half_tokens = total_tokens / 2;
+
+  const dtype *out_per_step[4] = {out_0, out_1, out_2, out_3};
+  const float *lse_per_step[4] = {lse_0, lse_1, lse_2, lse_3};
+  int lse_per_step_seqlen[4] = {
+      lse_0_seqlen, lse_1_seqlen, lse_2_seqlen, lse_3_seqlen};
+
+  for (int token_id = tile_id; token_id < total_tokens; token_id += num_tiles) {
+    bool is_second_half = token_id >= half_tokens;
+    for (int head_id = blockIdx.y; head_id < num_heads; head_id += gridDim.y) {
+      size_t lse_idx = static_cast<size_t>(head_id) * lse_seqlen + token_id;
+      float final_lse = lse_per_step[0][
+          static_cast<size_t>(head_id) * lse_per_step_seqlen[0] + token_id];
+#pragma unroll
+      for (int step = 1; step < 4; ++step) {
+        bool full_step = step < full_step_count;
+        if (!full_step && !is_second_half) {
+          continue;
+        }
+        int source_token = full_step ? token_id : token_id - half_tokens;
+        float step_lse = lse_per_step[step][
+            static_cast<size_t>(head_id) * lse_per_step_seqlen[step] + source_token];
+        float max_scale = max(final_lse, step_lse);
+        float min_scale = min(final_lse, step_lse);
+        final_lse = max_scale + log(1.0f + exp(min_scale - max_scale));
+      }
+      if (lane_id == 0) {
+        lse[lse_idx] = final_lse;
+      }
+      size_t out_idx =
+          (static_cast<size_t>(token_id) * num_heads + head_id) * dim_per_head;
+      dtype *cur_out = out + out_idx;
+
+      for (int j = lane_id; j < num_loops_per_head; j += tile_size) {
+        float4 data = {};
+        dtype *acc = reinterpret_cast<dtype *>(&data);
+
+#pragma unroll
+        for (int step = 0; step < 4; ++step) {
+          bool full_step = step < full_step_count;
+          if (!full_step && !is_second_half) {
+            continue;
+          }
+          int source_token = full_step ? token_id : token_id - half_tokens;
+          size_t source_idx =
+              (static_cast<size_t>(source_token) * num_heads + head_id) * dim_per_head;
+          float weight = exp(
+              lse_per_step[step][static_cast<size_t>(head_id) *
+                                     lse_per_step_seqlen[step] +
+                                 source_token] -
+              final_lse);
+          float4 data_per_step =
+              reinterpret_cast<const float4 *>(out_per_step[step] + source_idx)[j];
+          dtype *value = reinterpret_cast<dtype *>(&data_per_step);
+#pragma unroll
+          for (int k = 0; k < sizeof(float4) / sizeof(dtype); ++k) {
+            acc[k] += value[k] == 0 ? 0 : value[k] * weight;
+          }
+        }
+        reinterpret_cast<float4 *>(cur_out)[j] = data;
+      }
+    }
+  }
+}
+
 /***************************************************************************************************
  * Support THD format for Context Parallel: Gradients correction in backward
  **************************************************************************************************/
