@@ -50,13 +50,15 @@ __global__ void thd_read_half_tensor_kernel(void *half, void *tensor, int *cu_se
  **************************************************************************************************/
 
 struct LseCorrectionFunctor {
-  __forceinline__ __device__ static void run(double *lse, float *half_lse, size_t idx,
+  template <typename lse_dtype>
+  __forceinline__ __device__ static void run(lse_dtype *lse, float *half_lse, size_t idx,
                                              size_t half_idx) {
-    double val = lse[idx];
-    float val_per_step = half_lse[half_idx];
-    double max_scale = max(val, val_per_step);
-    double min_scale = min(val, val_per_step);
-    lse[idx] = max_scale + log(1.0 + exp(min_scale - max_scale));
+    lse_dtype val = lse[idx];
+    lse_dtype val_per_step = static_cast<lse_dtype>(half_lse[half_idx]);
+    lse_dtype max_scale = max(val, val_per_step);
+    lse_dtype min_scale = min(val, val_per_step);
+    lse_dtype one = static_cast<lse_dtype>(1.0);
+    lse[idx] = max_scale + log(one + exp(min_scale - max_scale));
   }
 };
 

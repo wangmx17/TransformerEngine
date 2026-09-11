@@ -94,6 +94,7 @@ void init_extension() {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   NVTE_DECLARE_COMMON_PYBIND11_HANDLES(m)
+  m.attr("NVTE_MUSA_THD_LSE_FP32") = py::bool_(true);
   m.def("quantize", transformer_engine::pytorch::quantize, py::arg("tensor"), py::arg("quantizer"),
         py::arg("output") = py::none(), py::arg("noop") = py::none());
   m.def("dequantize", &transformer_engine::pytorch::dequantize, "Dequantize", py::arg("input"),
