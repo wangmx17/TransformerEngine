@@ -361,6 +361,12 @@ void thd_out_correction(at::Tensor out, const at::Tensor &out_per_step, const at
                         const at::Tensor &lse_per_step, const at::Tensor &cu_seqlens,
                         bool only_second_half, bool lse_packed);
 
+void thd_out_correction_4_single(at::Tensor out,
+                                 const std::vector<at::Tensor> &out_per_step,
+                                 const at::Tensor &lse,
+                                 const std::vector<at::Tensor> &lse_per_step,
+                                 const at::Tensor &cu_seqlens, int full_step_count);
+
 void thd_grad_correction(at::Tensor grad, const at::Tensor &grad_per_step,
                          const at::Tensor &cu_seqlens, const std::string &first_half,
                          const std::string &second_half);

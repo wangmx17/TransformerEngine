@@ -683,7 +683,8 @@ at::Tensor thd_read_half_tensor(const at::Tensor &tensor, const at::Tensor &cu_s
 
 void thd_second_half_lse_correction(at::Tensor lse, const at::Tensor &lse_per_step,
                                     const at::Tensor &cu_seqlens, bool lse_packed) {
-  NVTE_CHECK(lse.scalar_type() == at::ScalarType::Double);
+  NVTE_CHECK(lse.scalar_type() == at::ScalarType::Float ||
+             lse.scalar_type() == at::ScalarType::Double);
   NVTE_CHECK(lse_per_step.scalar_type() == at::ScalarType::Float);
   NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
   NVTE_CHECK(cu_seqlens.dim() == 1);
@@ -720,16 +721,30 @@ void thd_second_half_lse_correction(at::Tensor lse, const at::Tensor &lse_per_st
   unsigned int grid_x = (lse_seqlen / 2 + block - 1) / block;
   unsigned int grid_y = num_heads;
   dim3 grid = {grid_x, grid_y};
-  if (lse_packed) {
-    thd_lse_kernel<double, true, LseCorrectionFunctor>
-        <<<grid, block, sizeof(int) * (batch + 1), at::musa::getCurrentMUSAStream()>>>(
-            lse.data_ptr<double>(), lse_per_step.data_ptr<float>(), cu_seqlens.data_ptr<int>(),
-            batch, num_heads, lse_seqlen, second_half_lse_seqlen);
+  if (lse.scalar_type() == at::ScalarType::Float) {
+    if (lse_packed) {
+      thd_lse_kernel<float, true, LseCorrectionFunctor>
+          <<<grid, block, sizeof(int) * (batch + 1), at::musa::getCurrentMUSAStream()>>>(
+              lse.data_ptr<float>(), lse_per_step.data_ptr<float>(), cu_seqlens.data_ptr<int>(),
+              batch, num_heads, lse_seqlen, second_half_lse_seqlen);
+    } else {
+      thd_lse_kernel<float, false, LseCorrectionFunctor>
+          <<<grid, block, sizeof(int) * (batch + 1), at::musa::getCurrentMUSAStream()>>>(
+              lse.data_ptr<float>(), lse_per_step.data_ptr<float>(), cu_seqlens.data_ptr<int>(),
+              batch, num_heads, lse_seqlen, second_half_lse_seqlen);
+    }
   } else {
-    thd_lse_kernel<double, false, LseCorrectionFunctor>
-        <<<grid, block, sizeof(int) * (batch + 1), at::musa::getCurrentMUSAStream()>>>(
-            lse.data_ptr<double>(), lse_per_step.data_ptr<float>(), cu_seqlens.data_ptr<int>(),
-            batch, num_heads, lse_seqlen, second_half_lse_seqlen);
+    if (lse_packed) {
+      thd_lse_kernel<double, true, LseCorrectionFunctor>
+          <<<grid, block, sizeof(int) * (batch + 1), at::musa::getCurrentMUSAStream()>>>(
+              lse.data_ptr<double>(), lse_per_step.data_ptr<float>(), cu_seqlens.data_ptr<int>(),
+              batch, num_heads, lse_seqlen, second_half_lse_seqlen);
+    } else {
+      thd_lse_kernel<double, false, LseCorrectionFunctor>
+          <<<grid, block, sizeof(int) * (batch + 1), at::musa::getCurrentMUSAStream()>>>(
+              lse.data_ptr<double>(), lse_per_step.data_ptr<float>(), cu_seqlens.data_ptr<int>(),
+              batch, num_heads, lse_seqlen, second_half_lse_seqlen);
+    }
   }
 }
 
@@ -886,6 +901,88 @@ void thd_out_correction(at::Tensor out, const at::Tensor &out_per_step, const at
     } else {
       NVTE_ERROR("Unsupported dtype of out\n");
     }
+  }
+}
+
+template <typename dtype>
+static void thd_out_correction_4_single_helper(
+    at::Tensor out, const std::vector<at::Tensor> &out_per_step, const at::Tensor &lse,
+    const std::vector<at::Tensor> &lse_per_step, int full_step_count) {
+  constexpr int tile = 16;
+  constexpr int block = 512;
+
+  int total_tokens = out.size(0);
+  int num_heads = out.size(1);
+  int dim_per_head = out.size(2);
+  int lse_seqlen = lse.size(2);
+  int lse_per_step_seqlen[4];
+
+  for (int step = 0; step < 4; ++step) {
+    int expected_tokens = step < full_step_count ? total_tokens : total_tokens / 2;
+    NVTE_CHECK(out_per_step[step].scalar_type() == out.scalar_type());
+    NVTE_CHECK(out_per_step[step].dim() == 3);
+    NVTE_CHECK(out_per_step[step].size(0) == expected_tokens);
+    NVTE_CHECK(out_per_step[step].size(1) == num_heads);
+    NVTE_CHECK(out_per_step[step].size(2) == dim_per_head);
+    NVTE_CHECK(out_per_step[step].is_contiguous());
+
+    NVTE_CHECK(lse_per_step[step].scalar_type() == at::ScalarType::Float);
+    NVTE_CHECK(lse_per_step[step].dim() == 3);
+    NVTE_CHECK(lse_per_step[step].size(0) == 1);
+    NVTE_CHECK(lse_per_step[step].size(1) == num_heads);
+    lse_per_step_seqlen[step] = lse_per_step[step].size(2);
+    NVTE_CHECK(lse_per_step_seqlen[step] >= expected_tokens);
+    NVTE_CHECK(lse_per_step[step].is_contiguous());
+  }
+
+  unsigned int grid_x =
+      (static_cast<size_t>(total_tokens) * tile + block - 1) / block;
+  dim3 grid = {grid_x, static_cast<unsigned int>(num_heads)};
+  thd_out_correction_4_single_kernel<dtype, tile>
+      <<<grid, block, 0, at::musa::getCurrentMUSAStream()>>>(
+          out.data_ptr<dtype>(), out_per_step[0].data_ptr<dtype>(),
+          out_per_step[1].data_ptr<dtype>(), out_per_step[2].data_ptr<dtype>(),
+          out_per_step[3].data_ptr<dtype>(), lse.data_ptr<float>(),
+          lse_per_step[0].data_ptr<float>(), lse_per_step[1].data_ptr<float>(),
+          lse_per_step[2].data_ptr<float>(), lse_per_step[3].data_ptr<float>(),
+          full_step_count, total_tokens, num_heads, dim_per_head, lse_seqlen,
+          lse_per_step_seqlen[0], lse_per_step_seqlen[1], lse_per_step_seqlen[2],
+          lse_per_step_seqlen[3]);
+}
+
+void thd_out_correction_4_single(at::Tensor out,
+                                 const std::vector<at::Tensor> &out_per_step,
+                                 const at::Tensor &lse,
+                                 const std::vector<at::Tensor> &lse_per_step,
+                                 const at::Tensor &cu_seqlens, int full_step_count) {
+  NVTE_CHECK(out_per_step.size() == 4);
+  NVTE_CHECK(lse_per_step.size() == 4);
+  NVTE_CHECK(full_step_count >= 1 && full_step_count <= 4);
+  NVTE_CHECK(out.dim() == 3);
+  NVTE_CHECK(out.is_contiguous());
+  NVTE_CHECK(out.size(0) % 2 == 0);
+  NVTE_CHECK((out.size(2) * c10::elementSize(out.scalar_type())) % sizeof(float4) == 0);
+  NVTE_CHECK(lse.scalar_type() == at::ScalarType::Float);
+  NVTE_CHECK(lse.dim() == 3);
+  NVTE_CHECK(lse.size(0) == 1);
+  NVTE_CHECK(lse.size(1) == out.size(1));
+  NVTE_CHECK(lse.size(2) >= out.size(0));
+  NVTE_CHECK(lse.is_contiguous());
+  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens.dim() == 1);
+  NVTE_CHECK(cu_seqlens.size(0) == 2);
+
+  if (out.scalar_type() == at::ScalarType::Half) {
+    thd_out_correction_4_single_helper<at::Half>(out, out_per_step, lse, lse_per_step,
+                                                  full_step_count);
+  } else if (out.scalar_type() == at::ScalarType::BFloat16) {
+    thd_out_correction_4_single_helper<at::BFloat16>(out, out_per_step, lse, lse_per_step,
+                                                      full_step_count);
+  } else if (out.scalar_type() == at::ScalarType::Float) {
+    thd_out_correction_4_single_helper<float>(out, out_per_step, lse, lse_per_step,
+                                               full_step_count);
+  } else {
+    NVTE_ERROR("Unsupported dtype of out\n");
   }
 }
 
