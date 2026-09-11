@@ -60,21 +60,6 @@ def test_thd_second_half_lse_correction(lse_dtype, lse_packed):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("half_idx", [0, 1])
-def test_thd_read_half_tensor_3(dtype, half_idx):
-    torch.manual_seed(1234)
-    cu_seqlens = torch.tensor([0, 8, 12], dtype=torch.int32, device="musa")
-    tensors = [torch.randn(12, 4, 64, dtype=dtype, device="musa") for _ in range(3)]
-    expected = [tex.thd_read_half_tensor(x, cu_seqlens, half_idx) for x in tensors]
-
-    actual = tex.thd_read_half_tensor_3(*tensors, cu_seqlens, half_idx)
-
-    assert len(actual) == 3
-    for actual_tensor, expected_tensor in zip(actual, expected):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("full_step_count", [1, 2, 4])
 def test_thd_out_correction_4_single(dtype, full_step_count):
     torch.manual_seed(1234)

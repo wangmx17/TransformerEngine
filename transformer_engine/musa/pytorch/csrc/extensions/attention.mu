@@ -677,51 +677,6 @@ at::Tensor thd_read_half_tensor(const at::Tensor &tensor, const at::Tensor &cu_s
   return half;
 }
 
-std::vector<at::Tensor> thd_read_half_tensor_3(const at::Tensor &tensor_0,
-                                               const at::Tensor &tensor_1,
-                                               const at::Tensor &tensor_2,
-                                               const at::Tensor &cu_seqlens, int half_idx) {
-  NVTE_CHECK(tensor_0.dim() == 3);
-  NVTE_CHECK(tensor_1.dim() == 3);
-  NVTE_CHECK(tensor_2.dim() == 3);
-  NVTE_CHECK(tensor_0.sizes() == tensor_1.sizes());
-  NVTE_CHECK(tensor_0.sizes() == tensor_2.sizes());
-  NVTE_CHECK(tensor_0.scalar_type() == tensor_1.scalar_type());
-  NVTE_CHECK(tensor_0.scalar_type() == tensor_2.scalar_type());
-  NVTE_CHECK(tensor_0.is_contiguous());
-  NVTE_CHECK(tensor_1.is_contiguous());
-  NVTE_CHECK(tensor_2.is_contiguous());
-  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
-  NVTE_CHECK(cu_seqlens.dim() == 1);
-  NVTE_CHECK(cu_seqlens.size(0) >= 2);
-  NVTE_CHECK(half_idx == 0 || half_idx == 1);
-
-  int batch = cu_seqlens.size(0) - 1;
-  int num_heads = tensor_0.size(1);
-  int dim_per_head = tensor_0.size(2);
-  int hidden_size_in_bytes =
-      num_heads * dim_per_head * c10::elementSize(tensor_0.scalar_type());
-  NVTE_CHECK(hidden_size_in_bytes % 16 == 0);
-
-  std::vector<int64_t> shape = {tensor_0.size(0) / 2, num_heads, dim_per_head};
-  at::Tensor half_0 = at::empty(
-      shape, tensor_0.options().device(c10::kPrivateUse1, c10::musa::current_device()));
-  at::Tensor half_1 = at::empty(
-      shape, tensor_1.options().device(c10::kPrivateUse1, c10::musa::current_device()));
-  at::Tensor half_2 = at::empty(
-      shape, tensor_2.options().device(c10::kPrivateUse1, c10::musa::current_device()));
-
-  constexpr unsigned int block = 256;
-  unsigned int grid_x = (tensor_0.size(0) / 2 * 32 + block - 1) / block;
-  thd_read_half_tensor_3_kernel<<<grid_x, block, sizeof(int) * (batch + 1),
-                                  at::musa::getCurrentMUSAStream()>>>(
-      half_0.data_ptr(), half_1.data_ptr(), half_2.data_ptr(), tensor_0.data_ptr(),
-      tensor_1.data_ptr(), tensor_2.data_ptr(), cu_seqlens.data_ptr<int>(), batch,
-      hidden_size_in_bytes, half_idx, tensor_0.size(0));
-
-  return {half_0, half_1, half_2};
-}
-
 /***************************************************************************************************
  * Support THD format for Context Parallel: softmax_lse related operations
  **************************************************************************************************/

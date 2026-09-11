@@ -351,11 +351,6 @@ size_t get_mudnn_version();
 at::Tensor thd_read_half_tensor(const at::Tensor &tensor, const at::Tensor &cu_seqlens,
                                 int half_idx);
 
-std::vector<at::Tensor> thd_read_half_tensor_3(const at::Tensor &tensor_0,
-                                               const at::Tensor &tensor_1,
-                                               const at::Tensor &tensor_2,
-                                               const at::Tensor &cu_seqlens, int half_idx);
-
 void thd_second_half_lse_correction(at::Tensor lse, const at::Tensor &lse_per_step,
                                     const at::Tensor &cu_seqlens, bool lse_packed);
 
