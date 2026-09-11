@@ -275,6 +275,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Read the first half(half_idx=0) or the second half(half_idx=1) of each sequence in a THD "
         "tensor",
         py::call_guard<py::gil_scoped_release>());
+  m.def("thd_read_half_tensor_3", &thd_read_half_tensor_3,
+        "Read the same half from three THD tensors in one kernel launch",
+        py::call_guard<py::gil_scoped_release>());
   m.def("thd_second_half_lse_correction", &thd_second_half_lse_correction,
         "Correct the second half of the softmax_lse", py::call_guard<py::gil_scoped_release>());
   m.def("thd_read_second_half_lse", &thd_read_second_half_lse,

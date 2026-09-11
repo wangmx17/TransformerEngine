@@ -3224,10 +3224,17 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
                         kv_ = kv.view(-1, *kv.shape[-4:])
                     elif ctx.qkv_format == "thd":
                         # [t, np, hn] -> [t/2, np, hn]
-                        q_, out_, dout_ = [
-                            tex.thd_read_half_tensor(x, cu_seqlens_q_padded, 1)
-                            for x in [q, out, dout]
-                        ]
+                        if int(os.getenv("NVTE_MUSA_THD_BWD_READ_HALF_FUSION", "0")) and hasattr(
+                            tex, "thd_read_half_tensor_3"
+                        ):
+                            q_, out_, dout_ = tex.thd_read_half_tensor_3(
+                                q, out, dout, cu_seqlens_q_padded, 1
+                            )
+                        else:
+                            q_, out_, dout_ = [
+                                tex.thd_read_half_tensor(x, cu_seqlens_q_padded, 1)
+                                for x in [q, out, dout]
+                            ]
                         kv_ = kv
                     if ctx.use_fused_attention:
                         q_, out_, dout_ = [x.contiguous() for x in [q_, out_, dout_]]

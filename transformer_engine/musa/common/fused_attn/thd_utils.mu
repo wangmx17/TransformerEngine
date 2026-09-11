@@ -74,5 +74,49 @@ __global__ void thd_read_half_tensor_kernel(void *half, void *tensor, int *cu_se
   }
 }
 
+__global__ void thd_read_half_tensor_3_kernel(void *half_0, void *half_1, void *half_2,
+                                              void *tensor_0, void *tensor_1, void *tensor_2,
+                                              int *cu_seqlens, int batch,
+                                              int hidden_size_in_bytes, int half_idx,
+                                              int dim_size_of_token) {
+  extern __shared__ int cu_seqlens_s[];
+  for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
+    cu_seqlens_s[i] = cu_seqlens[i] / 2;
+  }
+  __syncthreads();
+
+  int warpid = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  int laneid = threadIdx.x % 32;
+  int num_warps = (blockDim.x * gridDim.x) / 32;
+  int num_total_tokens = cu_seqlens_s[batch];
+  int num_float4s_per_token = hidden_size_in_bytes / sizeof(float4);
+
+  for (int token_id = warpid; token_id < num_total_tokens; token_id += num_warps) {
+    int seqid = binary_search(token_id, cu_seqlens_s, batch + 1);
+    size_t half_offset = static_cast<size_t>(token_id) * hidden_size_in_bytes;
+    size_t tensor_offset =
+        (static_cast<size_t>(token_id) + cu_seqlens_s[seqid + half_idx]) * hidden_size_in_bytes;
+
+    float4 *half_token_0 =
+        reinterpret_cast<float4 *>(reinterpret_cast<char *>(half_0) + half_offset);
+    float4 *half_token_1 =
+        reinterpret_cast<float4 *>(reinterpret_cast<char *>(half_1) + half_offset);
+    float4 *half_token_2 =
+        reinterpret_cast<float4 *>(reinterpret_cast<char *>(half_2) + half_offset);
+    float4 *tensor_token_0 =
+        reinterpret_cast<float4 *>(reinterpret_cast<char *>(tensor_0) + tensor_offset);
+    float4 *tensor_token_1 =
+        reinterpret_cast<float4 *>(reinterpret_cast<char *>(tensor_1) + tensor_offset);
+    float4 *tensor_token_2 =
+        reinterpret_cast<float4 *>(reinterpret_cast<char *>(tensor_2) + tensor_offset);
+
+    for (int idx = laneid; idx < num_float4s_per_token; idx += 32) {
+      half_token_0[idx] = tensor_token_0[idx];
+      half_token_1[idx] = tensor_token_1[idx];
+      half_token_2[idx] = tensor_token_2[idx];
+    }
+  }
+}
+
 }  // namespace fused_attn
 }  // namespace transformer_engine

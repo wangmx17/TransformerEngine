@@ -45,6 +45,12 @@ __global__ void thd_read_half_tensor_kernel(void *half, void *tensor, int *cu_se
                                             int hidden_size_in_bytes, int half_idx,
                                             int dim_size_of_token);
 
+__global__ void thd_read_half_tensor_3_kernel(void *half_0, void *half_1, void *half_2,
+                                              void *tensor_0, void *tensor_1, void *tensor_2,
+                                              int *cu_seqlens, int batch,
+                                              int hidden_size_in_bytes, int half_idx,
+                                              int dim_size_of_token);
+
 /***************************************************************************************************
  * Support THD format for Context Parallel: softmax_lse related operations
  **************************************************************************************************/
